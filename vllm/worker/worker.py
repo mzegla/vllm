@@ -83,11 +83,13 @@ class Worker:
             torch.cuda.set_device(self.device)
 
             _check_if_gpu_supports_dtype(self.model_config.dtype)
-        else:
-            raise RuntimeError(
-                f"Not support device type: {self.device_config.device}")
+        # else:
+        #     raise RuntimeError(
+        #         f"Not support device type: {self.device_config.device}")
         # Initialize the distributed environment.
-        init_distributed_environment(self.parallel_config, self.rank,
+        init_distributed_environment(self.parallel_config,
+                                     self.device_config,
+                                     self.rank,
                                      self.distributed_init_method)
         if not self.parallel_config.disable_custom_all_reduce:
             init_custom_ar()
@@ -232,6 +234,7 @@ class Worker:
 
 def init_distributed_environment(
     parallel_config: ParallelConfig,
+    device_config: DeviceConfig,
     rank: int,
     distributed_init_method: Optional[str] = None,
 ) -> None:
@@ -249,14 +252,14 @@ def init_distributed_environment(
             "is not already initialized")
     else:
         torch.distributed.init_process_group(
-            backend="nccl",
+            backend="gloo" if device_config.device == torch.device('cpu') else "nccl",
             world_size=parallel_config.world_size,
             rank=rank,
             init_method=distributed_init_method,
         )
 
     # A small all_reduce for warmup.
-    torch.distributed.all_reduce(torch.zeros(1).cuda())
+    torch.distributed.all_reduce(torch.zeros(1, device=device_config.device))
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
 
