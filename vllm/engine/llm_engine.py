@@ -337,11 +337,11 @@ class LLMEngine:
         logger.info(f"# GPU blocks: {num_gpu_blocks}, "
                     f"# CPU blocks: {num_cpu_blocks}")
 
-        if num_gpu_blocks <= 0:
+        if num_gpu_blocks < 0 or (not self.device_config.device.type == 'cpu' and num_gpu_blocks == 0):
             raise ValueError("No available memory for the cache blocks. "
                              "Try increasing `gpu_memory_utilization` when "
                              "initializing the engine.")
-        max_seq_len = self.cache_config.block_size * num_gpu_blocks
+        max_seq_len = self.cache_config.block_size * (num_gpu_blocks if not self.device_config.device.type == 'cpu' else num_cpu_blocks)
         if self.model_config.max_model_len > max_seq_len:
             raise ValueError(
                 f"The model's max seq len ({self.model_config.max_model_len}) "
@@ -842,7 +842,7 @@ class LLMEngine:
         # KV Cache Usage in %.
         num_total_gpu = self.cache_config.num_gpu_blocks
         num_free_gpu = self.scheduler.block_manager.get_num_free_gpu_blocks()
-        gpu_cache_usage = 1.0 - (num_free_gpu / num_total_gpu)
+        gpu_cache_usage = (1.0 - (num_free_gpu / num_total_gpu)) if num_total_gpu > 0 else 0.0
 
         num_total_cpu = self.cache_config.num_cpu_blocks
         cpu_cache_usage = 0.

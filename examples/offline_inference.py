@@ -3,16 +3,16 @@ import torch
 
 # Sample prompts.
 prompts = [
-    "Hello, my name is",
-    "The president of the United States is",
-    "The capital of France is",
-    "The future of AI is",
+    "What is OpenVINO?",
+    # "The president of the United States is",
+    # "The capital of France is",
+    # "The future of AI is",
 ]
 # Create a sampling params object.
-sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+sampling_params = SamplingParams(max_tokens=64, ignore_eos=True)
 
 # Create an LLM.
-llm = LLM(model="facebook/opt-125m", dtype=torch.float32, device='cpu', seed=42)
+llm = LLM(model="mistralai/Mistral-7B-v0.1", dtype=torch.float32, device='cpu', enforce_eager=True, trust_remote_code=True, seed=42, max_model_len=1024)
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 outputs = llm.generate(prompts, sampling_params)

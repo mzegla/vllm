@@ -35,9 +35,13 @@ _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [8 * i for i in range(1, 33)]
 
 is_openvino = True if os.getenv('VLLM_OPENVINO', "0") == "1" else False
 
+current_iteration_idx = 0
+total_time_second_token = 0
+
 def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     if hasattr(model, '_openvino_patch_orig_forward'):
         return
+    print(' ============= PATCHING MODEL =============')
     # model._openvino_patch_orig_forward = model.forward
     # Replace forward with our stuff
     import openvino as ov
@@ -56,6 +60,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     @dataclass
     class InputMetadata:
         """Metadata for input sequences. Used in PagedAttention.
+
         Args:
             prompt_lens: Lengths of prompts.
             slot_mapping: The address to write the new KV to of each token.
@@ -130,9 +135,14 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     input_meta = {"is_prompt": torch.tensor(False), "slot_mapping": slot_mapping, "max_seq_len": torch.tensor(256), "max_context_len": torch.tensor(2048), "context_lens": context_lens, "block_tables": block_tables}
 
     fp_type = torch.float32
+    num_heads = pt_model.config.num_attention_heads
+    head_size = pt_model.config.hidden_size
+    head_dim = head_size // num_heads
 
+    # // value_cache: shape = [num_blocks, num_kv_heads, head_size, block_size]
+    # // key_cache: shape [num_blocks, num_kv_heads, head_size/x, block_size, x]
     #TODO: Take example tensors from model_args/model_kwargs
-    kv_cache = [(torch.ones((3640, 12, 16, 16, 4), dtype=fp_type), torch.ones((3640, 12, 64, 16), dtype=fp_type))] * 12
+    kv_cache = [(torch.ones((3640, 12, 16, 16, 4), dtype=fp_type), torch.ones((3640, 12, 64, 16), dtype=fp_type))] * model_config.hf_config.num_hidden_layers
 
     example_input = (torch.ones((1, 1), dtype=torch.long), torch.range(0, 10, dtype=torch.long).unsqueeze(0)[:, -1:], tuple(kv_cache), input_meta)
     class ModelWrapper(torch.nn.Module):
@@ -147,10 +157,6 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
 
     model_wrapper = ModelWrapper(pt_model)
 
-    num_heads = pt_model.config.num_attention_heads
-    embed_dim = pt_model.config.hidden_size
-    head_dim = embed_dim // num_heads
-
     ov_dtype_maping = {
         torch.bool: ov.Type.boolean,
         torch.float32: ov.Type.f32,
@@ -160,6 +166,16 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         torch.int64: ov.Type.i64
     }
 
+    # avoid usage of vllm._C.ops
+    from vllm.model_executor.layers.activation import SiluAndMul, NewGELU, FastGELU
+    from vllm.model_executor.layers.layernorm import RMSNorm
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+
+    SiluAndMul.forward = SiluAndMul._forward
+    NewGELU.forward = NewGELU._forward
+    FastGELU.forward = FastGELU._forward
+    RMSNorm.forward = RMSNorm._forward
+    RotaryEmbedding.forward = RotaryEmbedding._forward
 
     def flattenize_inputs(inputs):
         """
@@ -187,21 +203,23 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
     input_names.extend(list(input_meta))
 
     def wrapper(module, target_op, *args, **kwargs):
+        # this function will replace entier PageAttention module
+        # target_op is PageAttentionExtension, the order of arguments below should match the extension signature
         return target_op(
-                            args[0],
-                            args[1],
-                            args[2],
-                            args[3],
-                            args[4],
-                            args[5].is_prompt,
-                            args[5].slot_mapping,
-                            args[5].max_context_len,
-                            args[5].context_lens,
-                            args[5].block_tables,
-                            torch.tensor(module.scale)
-                        )
-    # def wrapper(module, target_op, *args, **kwargs):
-    #     return args[0]
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5].is_prompt,
+            args[5].slot_mapping,
+            args[5].max_context_len,
+            args[5].context_lens,
+            args[5].block_tables,
+            torch.tensor(module.scale),  # wrap in a tensor, otherwise it will not appear in the trace
+            torch.tensor(module.alibi_slopes if module.alibi_slopes is not None else [], dtype=torch.float32),  # alibi_slopes
+            torch.tensor(module.sliding_window if module.sliding_window is not None else 0, dtype=torch.int32)  # sliding_window
+        )
 
     with torch.no_grad():
         print('>>>>>>>>>>>>> CONVERTING OV MODEL')
@@ -211,9 +229,9 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             extension=[
                 ModuleExtension(
                     PagedAttention,
-                    extension=lambda module: 'PagedAttentionExtension',
-                    replacer=lambda module, *args, **kwargs: args[0],
-                    wrapper=wrapper
+                    target_op='PagedAttentionExtension',
+                    evaluate=lambda module, *args, **kwargs: args[0],  # need this because PagedAttention module fails in torch.jit.trace
+                    convert=wrapper
                 ),
                 "libuser_ov_extensions.so"
             ]
@@ -228,19 +246,20 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         for out_name, out in zip(output_names, ov_model.outputs):
             out.get_tensor().set_names({out_name})
         ov_model.validate_nodes_and_infer_types()
-        #ov.save_model(ov_model, "vllm_openvino_model.xml")
+        # ov.save_model(ov_model, "vllm_openvino_model.xml")
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
-        print(ov_model)
+        #print(ov_model)
 
     core = ov.Core()
     core.add_extension("libuser_ov_extensions.so")
     ov_config = {ov.properties.enable_profiling: True}
+    # ov_config = {}
     ov_compiled = core.compile_model(ov_model, "CPU", config=ov_config)
     ov_request = ov_compiled.create_infer_request()
 
     from functools import partial
     def wrapper(*args, **kwargs):
-        print('OV FORWARD WRAPPER')
+        #print('OV FORWARD WRAPPER')
         #print(f'model class: {type(args[0])}')
         #for i, input in enumerate(args[1:]):
         #    print(f'[{i}]: {type(input)}')
@@ -256,8 +275,8 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             assert t.flags["C_CONTIGUOUS"]
             return t
         flatten_kv_cache = flattenize_inputs(kwargs['kv_caches'])
-        total_size = sum([torch.numel(t) for t in flatten_kv_cache])
-        print(f'kv-cache total size: {total_size}')
+        #total_size = sum([torch.numel(t) for t in flatten_kv_cache])
+        #print(f'kv-cache total size: {total_size}')
         flatten_kv_cache = [prepare_data(t) for t in flatten_kv_cache]
         inputs = [
             kwargs['input_ids'],
@@ -265,7 +284,7 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
             *flatten_kv_cache,
             input_metadata.is_prompt, input_metadata.slot_mapping
         ]
-        print('slot_mapping:', input_metadata.slot_mapping)
+        #print('slot_mapping:', input_metadata.slot_mapping)
         if input_metadata.max_context_len is not None:
             # available from the second iteration
             inputs.append(input_metadata.max_context_len)
@@ -276,9 +295,9 @@ def patch_model_with_openvino(model, model_config, *model_args, **model_kwargs):
         result = ov_request.infer(inputs, share_inputs=True, share_outputs=False)
         #print(f'result: {type(result)}')
         return torch.from_numpy(result[0])
-    print(' ============= PATCHING MODEL =============')
     model._openvino_patch_orig_forward = model.forward
     model.forward = partial(wrapper, model)
+
 
 class ModelRunner:
 
@@ -931,12 +950,11 @@ class ModelRunner:
 
         # Prepare dummy inputs. These will be reused for all batch sizes.
         max_batch_size = max(_BATCH_SIZES_TO_CAPTURE)
-        input_tokens = torch.zeros(max_batch_size, 1, dtype=torch.long).cuda()
-        input_positions = torch.zeros(max_batch_size, 1,
-                                      dtype=torch.long).cuda()
-        slot_mapping = torch.empty(max_batch_size, 1, dtype=torch.long).cuda()
+        input_tokens = torch.zeros(max_batch_size, 1, dtype=torch.long, device=self.device)
+        input_positions = torch.zeros(max_batch_size, 1, dtype=torch.long, device=self.device)
+        slot_mapping = torch.empty(max_batch_size, 1, dtype=torch.long, device=self.device)
         slot_mapping.fill_(_PAD_SLOT_ID)
-        context_lens = torch.ones(max_batch_size, dtype=torch.int32).cuda()
+        context_lens = torch.ones(max_batch_size, dtype=torch.int32, device=self.device)
         block_tables = torch.from_numpy(self.graph_block_tables).cuda()
 
         graph_batch_size = _get_graph_batch_size(
