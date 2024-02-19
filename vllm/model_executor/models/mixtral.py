@@ -92,13 +92,11 @@ class MixtralMoE(nn.Module):
             torch.empty(self.num_total_experts,
                         2 * self.intermediate_size,
                         self.hidden_size,
-                        device="cuda",
                         dtype=self.params_dtype))
         self.w2s = nn.Parameter(
             torch.empty(self.num_total_experts,
                         self.hidden_size,
                         self.intermediate_size,
-                        device="cuda",
                         dtype=self.params_dtype))
 
         set_weight_attrs(self.ws, {

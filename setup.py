@@ -212,7 +212,7 @@ def get_torch_arch_list() -> Set[str]:
 if _is_hip():
     rocm_arches = get_pytorch_rocm_arch()
     NVCC_FLAGS += ["--offload-arch=" + arch for arch in rocm_arches]
-else:
+elif _is_cuda():
     # First, check the TORCH_CUDA_ARCH_LIST environment variable.
     compute_capabilities = get_torch_arch_list()
 
@@ -355,7 +355,7 @@ if _is_cuda():
             },
         ))
 
-if not _is_neuron():
+if _is_hip() or _is_cuda():
     vllm_extension = CUDAExtension(
         name="vllm._C",
         sources=vllm_extension_sources,
@@ -400,7 +400,7 @@ def get_vllm_version() -> str:
         if neuron_version != MAIN_CUDA_VERSION:
             neuron_version_str = neuron_version.replace(".", "")[:3]
             version += f"+neuron{neuron_version_str}"
-    else:
+    elif _is_cuda():
         cuda_version = str(nvcc_cuda_version)
         if cuda_version != MAIN_CUDA_VERSION:
             cuda_version_str = cuda_version.replace(".", "")[:3]
