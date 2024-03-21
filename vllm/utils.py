@@ -135,6 +135,13 @@ def is_openvino() -> bool:
     return is_openvino_available
 
 def is_openvino_optimum_intel() -> bool:
+    #### Temporary workaround to have a easy to use swtich
+    if os.environ["VLLM_OPENVINO_OPTIMUM"] == "1":
+        return True
+    else:
+        return False
+    #####
+
     is_optimum_intel_available = is_openvino()
     try:
         import optimum.intel

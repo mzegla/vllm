@@ -49,6 +49,7 @@ class HfRunner:
         model_name: str,
         tokenizer_name: Optional[str] = None,
         dtype: str = "half",
+        device: str = "cuda",
     ) -> None:
         assert dtype in _STR_DTYPE_TO_TORCH_DTYPE
         torch_dtype = _STR_DTYPE_TO_TORCH_DTYPE[dtype]
@@ -56,7 +57,11 @@ class HfRunner:
             model_name,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
-        ).cuda()
+        )
+        self.device = device
+        if self.device == "cuda":
+            self.model.cuda()
+
         if tokenizer_name is None:
             tokenizer_name = model_name
         self.tokenizer = get_tokenizer(tokenizer_name, trust_remote_code=True)
@@ -69,8 +74,12 @@ class HfRunner:
         outputs: List[Tuple[List[int], str]] = []
         for prompt in prompts:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
+
+            if self.device == "cuda":
+                input_ids = input_ids.cuda()
+            
             output_ids = self.model.generate(
-                input_ids.cuda(),
+                input_ids,
                 use_cache=True,
                 **kwargs,
             )
@@ -125,8 +134,12 @@ class HfRunner:
         all_logprobs = []
         for prompt in prompts:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
+
+            if self.device == "cuda":
+                input_ids = input_ids.cuda()
+            
             output = self.model.generate(
-                input_ids.cuda(),
+                input_ids,
                 use_cache=True,
                 do_sample=False,
                 max_new_tokens=max_tokens,
@@ -165,6 +178,7 @@ class VllmRunner:
         dtype: str = "half",
         disable_log_stats: bool = True,
         tensor_parallel_size: int = 1,
+        swap_space: int = 0,
         **kwargs,
     ) -> None:
         self.model = LLM(
@@ -172,7 +186,7 @@ class VllmRunner:
             tokenizer=tokenizer_name,
             trust_remote_code=True,
             dtype=dtype,
-            swap_space=0,
+            swap_space=swap_space,
             disable_log_stats=disable_log_stats,
             tensor_parallel_size=tensor_parallel_size,
             **kwargs,
